@@ -6,7 +6,7 @@ import pytz
 import os
 import yaml
 from router import BASE_TEMPERATURE, RouterDecision, route_query
-from minirag import rag_search
+from minirag import rag_search as minirag_search
 # endregion
 
 
@@ -39,7 +39,7 @@ def rag_search(query: str) -> str:
     Returns:
         str: The search results from the internal knowledge base.
     """
-    return rag_search(query)
+    return minirag_search(query)
 
 final_answer = FinalAnswerTool()  # обязательный инструмент: им агент завершает работу
 # endregion
@@ -55,25 +55,25 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct")
 ROUTER_MODEL = os.environ.get("ROUTER_MODEL", LLM_MODEL)
 
 
-def make_model(model_id: str):
+def make_model(model_id: str, temperature: float = BASE_TEMPERATURE):
     if LLM_BASE_URL:
         return OpenAIServerModel(
             model_id=model_id,
             api_base=LLM_BASE_URL,
             api_key=os.environ.get("LLM_API_KEY", "not-needed"),
             max_tokens=2096,
-            temperature=BASE_TEMPERATURE,
+            temperature=temperature,
         )
     return InferenceClientModel(
         max_tokens=2096,
-        temperature=BASE_TEMPERATURE,
+        temperature=temperature,
         model_id=model_id,
         custom_role_conversions=None,
     )
 
 
-router_model = make_model(ROUTER_MODEL)
-model = make_model(LLM_MODEL)
+# Роутер не должен быть "творческим": нулевая температура даёт повторяемые решения.
+router_model = make_model(ROUTER_MODEL, temperature=0.0)
 # endregion
 
 
@@ -81,46 +81,52 @@ model = make_model(LLM_MODEL)
 with open("prompts.yaml", 'r') as stream:
     prompt_templates = yaml.safe_load(stream)
 
-agent = CodeAgent(
-    model=model,
-    tools=[final_answer, nice_answer, transliterate_to_english, rag_search],
-    max_steps=6,
-    verbosity_level=2,
-    planning_interval=None,
-    name=None,
-    description=None,
-    prompt_templates=prompt_templates
-)
+
+def build_agent(temperature: float) -> CodeAgent:
+    """Новый агент и новая модель на каждый запрос: у агента своя память шагов,
+    а температура не лежит в общем объекте, который меняют параллельные запросы.
+    rag_search агенту не дан: решение о RAG принадлежит только роутеру.
+    """
+    return CodeAgent(
+        model=make_model(LLM_MODEL, temperature=temperature),
+        tools=[final_answer, nice_answer, transliterate_to_english],
+        max_steps=6,
+        verbosity_level=2,
+        planning_interval=None,
+        name=None,
+        description=None,
+        prompt_templates=prompt_templates,
+    )
 # endregion
 
 
-# region Router -> Agent 
+# region Router -> Agent
 TEMPERATURE_STEP = 0.2
 
 
 def answer(query: str) -> str:
-    """Router first, then the agent: the router picks the temperature and RAG flag."""
-    # 1. Роутер (router.py) спрашивает модель и возвращает RouterDecision
+    """Router first, then the agent: the router picks the temperature, RAG flag and cleaned query."""
+    # 1. Роутер (router.py) возвращает RouterDecision
     try:
         decision = route_query(query, router_model)
     except ValueError as exc:
-        # Router failed to produce valid JSON: fall back to the neutral decision with the original query.
+        # Router failed: neutral decision and the ORIGINAL query, nothing is lost.
         print(f"[router] fallback, reason: {exc}")
         decision = RouterDecision(needs_rag=False, temperature_delta=0, rewritten_query=query)
+    print(f"[router] original={query!r}\n[router] decision={decision}")
 
-    # 2. temperature_delta -> реальная температура в общей модели (это и есть передача данных агенту)
-    temperature = BASE_TEMPERATURE + decision.temperature_delta * TEMPERATURE_STEP
-    rewritten_query = decision.rewritten_query
-    model.kwargs["temperature"] = min(max(temperature, 0.0), 1.0)
-    print(f"[router] {decision}, temperature={model.kwargs['temperature']}")
+    # 2. temperature_delta -> температура ЭТОГО запроса (ограничена 0..1)
+    temperature = min(max(BASE_TEMPERATURE + decision.temperature_delta * TEMPERATURE_STEP, 0.0), 1.0)
 
-    # 3. needs_rag пока только печатается, агенту НЕ передаётся
+    # 3. needs_rag: поиск выполняется в коде, найденное кладётся в задачу агента
+    task = decision.rewritten_query
     if decision.needs_rag:
-        # RAG is not implemented yet: hook retrieval in here and pass the docs into the task.
-        print("[router] needs_rag=True, but RAG is not connected yet")
+        docs = minirag_search(decision.rewritten_query)
+        print(f"[rag] {docs!r}")
+        task = f"{task}\n\nКонтекст из базы знаний (отвечай по нему, не выдумывай факты):\n{docs}"
 
-    # 4. Агент стартует уже с обновлённой температурой и запросом без упоминаний инструментов
-    return agent.run(rewritten_query)
+    # 4. Агент создаётся уже с нужной температурой и итоговой задачей
+    return build_agent(temperature).run(task)
 # endregion
 
 

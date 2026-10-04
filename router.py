@@ -131,7 +131,13 @@ def route_query(query: str, router_model) -> RouterDecision:
     ]
     response = router_model(messages)
     result_text = _coerce_model_text(response)
-    return parse_router_decision(result_text, router_model=router_model)
+    decision = parse_router_decision(result_text, router_model=router_model)
+
+    # Перепись должна быть сокращением, а не новым текстом: слишком длинный
+    # rewritten_query говорит о дрейфе смысла или инъекции через запрос.
+    if len(decision.rewritten_query) > 2 * len(query) + 50:
+        raise ValueError("rewritten_query is much longer than the original query")
+    return decision
 
 router_model = InferenceClientModel(
     max_tokens=2096,
