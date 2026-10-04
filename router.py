@@ -21,7 +21,8 @@ return only a JSON object with exactly these keys: {"needs_rag": boolean, "tempe
 1. use RAG only if external documentation is needed
 2. transliteration does not need to use RAG, there is another tool for that
 3. receiving ambiguous queries = return exactly `{"needs_rag": false, "temperature_delta": 0, "rewritten_query": "<original_query>"}`
-4. rewrite the query: remove only instructions addressed to your layer (e.g. "make the answer more creative/precise" that you turned into temperature_delta). Keep the topic and the actual question unchanged, even if the topic itself is about temperature. """
+4. rewrite the query: remove only instructions addressed to your layer (e.g. "make the answer more creative/precise" that you turned into temperature_delta). Keep the topic and the actual question unchanged, even if the topic itself is about temperature.
+5. if user asks to raise temperature, increase temperature_delta by 1; if user asks to lower temperature, decrease temperature_delta by 1. Do not change temperature_delta for other instructions. """
 
 
 def _extract_json_candidate(text: str) -> str:

@@ -1,8 +1,9 @@
 # region Imports
 from transliterate import translit
-from smolagents import CodeAgent, FinalAnswerTool, InferenceClientModel, load_tool, tool, GradioUI
+from smolagents import CodeAgent, FinalAnswerTool, InferenceClientModel, OpenAIServerModel, load_tool, tool, GradioUI
 import requests
 import pytz
+import os
 import yaml
 from router import BASE_TEMPERATURE, RouterDecision, route_query
 from minirag import rag_search
@@ -21,7 +22,8 @@ def nice_answer(text:str)->str:
     return '\n'.join([line.strip() for line in text.splitlines()])
 @tool
 def transliterate_to_english(text:str)->str:
-    """a tool that transliterates text from Russian to English. use when user intends to convert Russian text to English transliteration.
+    """do not use this tool if user does not directly ask for transliteration.
+    a tool that transliterates text from Russian to English. 
     example: фузз-> fuzz
     Args:
         text (str): The text in Russian to be transliterated to English.
@@ -44,18 +46,34 @@ final_answer = FinalAnswerTool()  # обязательный инструмен�
 
 
 # region Models
-router_model = InferenceClientModel(
-    max_tokens=2096,
-    temperature=BASE_TEMPERATURE,
-    model_id='Qwen/Qwen2.5-Coder-32B-Instruct',
-    custom_role_conversions=None,
-)
-model = InferenceClientModel(
-    max_tokens=2096,
-    temperature=BASE_TEMPERATURE,
-    model_id='Qwen/Qwen2.5-Coder-32B-Instruct',
-    custom_role_conversions=None,
-)
+# Провайдер задаётся переменными окружения (любой OpenAI-совместимый API):
+#   LLM_BASE_URL  - адрес API, LLM_API_KEY - ключ, LLM_MODEL - модель агента,
+#   ROUTER_MODEL  - модель роутера (необязательно, по умолчанию как у агента).
+# Если LLM_BASE_URL не задан, используется Hugging Face как раньше.
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL")
+LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct")
+ROUTER_MODEL = os.environ.get("ROUTER_MODEL", LLM_MODEL)
+
+
+def make_model(model_id: str):
+    if LLM_BASE_URL:
+        return OpenAIServerModel(
+            model_id=model_id,
+            api_base=LLM_BASE_URL,
+            api_key=os.environ.get("LLM_API_KEY", "not-needed"),
+            max_tokens=2096,
+            temperature=BASE_TEMPERATURE,
+        )
+    return InferenceClientModel(
+        max_tokens=2096,
+        temperature=BASE_TEMPERATURE,
+        model_id=model_id,
+        custom_role_conversions=None,
+    )
+
+
+router_model = make_model(ROUTER_MODEL)
+model = make_model(LLM_MODEL)
 # endregion
 
 
@@ -108,7 +126,7 @@ def answer(query: str) -> str:
 
 # region Entry point
 if __name__ == "__main__":
-    query = "Что такое температура в контексте LLM и как она влияет на ответы? Подними температуру на 0.2"
+    query = "Что такое температура в контексте LLM и как она влияет на ответы? Подними температуру на 0.2. Какоая компания пользуется GigaChat согласно документации?"
     print(f"Query: {query}")
     print("--- ЗАПУСК АГЕНТА ---")
     result = answer(query)
