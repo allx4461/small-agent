@@ -75,13 +75,19 @@ def _coerce_model_text(response: Any) -> str:
     raise TypeError("Router model returned unsupported response type")
 
 
-def _repair_router_output(router_model, broken_output: str, error_text: str) -> str:
+def _repair_router_output(
+    router_model,
+    broken_output: str,
+    error_text: str,
+    system_prompt: str,
+    repair_prompt: str,
+) -> str:
     """если рутер вернул некорректный вывод, даем инфо об ошибке и просим исправить"""
     messages = [
-        {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {
             "role": "user",
-            "content": ROUTER_REPAIR_PROMPT.replace(
+            "content": repair_prompt.replace(
                 "{{broken_output}}", broken_output
             ).replace("{{error_text}}", error_text),
         },
@@ -90,7 +96,12 @@ def _repair_router_output(router_model, broken_output: str, error_text: str) -> 
     return _coerce_model_text(fixed)
 #endregion
 #region model functions
-def parse_router_decision(json_str: str, router_model=None) -> RouterDecision:
+def parse_router_decision(
+    json_str: str,
+    router_model=None,
+    system_prompt: str = ROUTER_SYSTEM_PROMPT,
+    repair_prompt: str = ROUTER_REPAIR_PROMPT,
+) -> RouterDecision:
     """Parse router decision; if parsing fails, optionally ask model to repair output.
 
     Loop detection stops retries when the model keeps repeating the same invalid payload 
@@ -113,7 +124,13 @@ def parse_router_decision(json_str: str, router_model=None) -> RouterDecision:
                 ) from exc
             seen_invalid_outputs.add(normalized)
 
-            candidate = _repair_router_output(router_model, candidate, str(exc))
+            candidate = _repair_router_output(
+                router_model,
+                candidate,
+                str(exc),
+                system_prompt,
+                repair_prompt,
+            )
 
     raise ValueError("Failed to parse router decision after repair attempts")
 
@@ -122,6 +139,8 @@ def route_query(
     query: str,
     router_model,
     conversation_context: str | None = None,
+    system_prompt: str = ROUTER_SYSTEM_PROMPT,
+    repair_prompt: str = ROUTER_REPAIR_PROMPT,
 ) -> RouterDecision:
     """из запроса формирует решение по температуре, rag, и переписанному запросу."""
     user_message = query
@@ -133,12 +152,14 @@ def route_query(
             f"Current user message:\n{query}"
         )
     messages = [
-        {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message},
     ]
     decision = parse_router_decision(
         _coerce_model_text(router_model(messages)),
         router_model=router_model,
+        system_prompt=system_prompt,
+        repair_prompt=repair_prompt,
     )
     if len(decision.rewritten_query) > 2 * len(query) + 50:
         raise ValueError("rewritten_query is much longer than the original query")

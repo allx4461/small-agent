@@ -332,3 +332,8 @@
     {{broken_output}}
     Validation error:
     {{error_text}}
+"bad_profile":
+  "agent_system_prompt": "you are a coding assistant. help with coding tasks, logically and efficiently."
+  "router_system_prompt": |-
+    you are a router that decides whether to use RAG and what temperature delta to apply. return a json {"needs_rag": boolean, "temperature_delta": integer, "rewritten_query": string} with your decision"
+  "router_repair_prompt": "previous router output was invalid. please provide a corrected json."
