@@ -3,10 +3,12 @@ import re
 from dataclasses import dataclass
 from typing import Any
 from smolagents import InferenceClientModel
-
-BASE_TEMPERATURE = 0.5
-ALLOWED_DELTAS = frozenset({-1, 0, 1})
-_MAX_PARSE_ATTEMPTS = 4
+from config import (
+    ALLOWED_DELTAS,
+    _MAX_PARSE_ATTEMPTS,
+    ROUTER_REPAIR_PROMPT,
+    ROUTER_SYSTEM_PROMPT,
+)
 
 
 @dataclass(frozen=True)
@@ -15,17 +17,9 @@ class RouterDecision:
     temperature_delta: int
     rewritten_query: str
 
-
-ROUTER_SYSTEM_PROMPT = """you are a router that decides whether to use RAG and what temperature delta to apply (if user asks to).
-return only a JSON object with exactly these keys: {"needs_rag": boolean, "temperature_delta": integer, "rewritten_query": string}
-1. use RAG only if external documentation is needed
-2. transliteration does not need to use RAG, there is another tool for that
-3. receiving ambiguous queries = return exactly `{"needs_rag": false, "temperature_delta": 0, "rewritten_query": "<original_query>"}`
-4. rewrite the query: remove only instructions addressed to your layer (e.g. "make the answer more creative/precise" that you turned into temperature_delta). Keep the topic and the actual question unchanged, even if the topic itself is about temperature.
-5. if user asks to raise temperature, increase temperature_delta by 1; if user asks to lower temperature, decrease temperature_delta by 1. Do not change temperature_delta for other instructions. """
-
-
+#region helper-functions
 def _extract_json_candidate(text: str) -> str:
+    """убирает лишние артефакты для корректного перевода в json"""
     stripped = text.strip()
     if stripped.startswith("```"):
         stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
@@ -41,6 +35,8 @@ def _extract_json_candidate(text: str) -> str:
 
 
 def _validate_router_payload(data: dict[str, Any]) -> RouterDecision:
+    """проверка переданного json и перевод в датакласс Router Decision
+    """
     if not isinstance(data, dict):
         raise ValueError("Parsed JSON is not a dictionary")
 
@@ -53,7 +49,7 @@ def _validate_router_payload(data: dict[str, Any]) -> RouterDecision:
         raise ValueError("needs_rag must be a boolean")
 
     temperature_delta = data["temperature_delta"]
-    if not isinstance(temperature_delta, int) or temperature_delta not in ALLOWED_DELTAS:
+    if type(temperature_delta) is not int or temperature_delta not in ALLOWED_DELTAS:
         raise ValueError("temperature_delta must be one of -1, 0, 1")
 
     rewritten = data["rewritten_query"]
@@ -68,6 +64,7 @@ def _validate_router_payload(data: dict[str, Any]) -> RouterDecision:
 
 
 def _coerce_model_text(response: Any) -> str:
+    """обрабатывает вывод модели, делая все строкой"""
     if isinstance(response, str):
         return response
 
@@ -79,27 +76,24 @@ def _coerce_model_text(response: Any) -> str:
 
 
 def _repair_router_output(router_model, broken_output: str, error_text: str) -> str:
+    """если рутер вернул некорректный вывод, даем инфо об ошибке и просим исправить"""
     messages = [
         {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
         {
             "role": "user",
-            "content": (
-                "Your previous router output is invalid. Fix it and return only valid JSON "
-                "with keys needs_rag (bool), temperature_delta (int in -1,0,1) and rewritten_query (non-empty string).\n"
-                f"Invalid output:\n{broken_output}\n"
-                f"Validation error: {error_text}"
-            ),
+            "content": ROUTER_REPAIR_PROMPT.replace(
+                "{{broken_output}}", broken_output
+            ).replace("{{error_text}}", error_text),
         },
     ]
     fixed = router_model(messages=messages)
     return _coerce_model_text(fixed)
-
-
+#endregion
+#region model functions
 def parse_router_decision(json_str: str, router_model=None) -> RouterDecision:
     """Parse router decision; if parsing fails, optionally ask model to repair output.
 
-    Loop detection stops retries when the model keeps repeating the same invalid
-    payload (common failure mode when instruction following degrades).
+    Loop detection stops retries when the model keeps repeating the same invalid payload 
     """
     candidate = json_str
     seen_invalid_outputs: set[str] = set()
@@ -124,24 +118,30 @@ def parse_router_decision(json_str: str, router_model=None) -> RouterDecision:
     raise ValueError("Failed to parse router decision after repair attempts")
 
 
-def route_query(query: str, router_model) -> RouterDecision:
+def route_query(
+    query: str,
+    router_model,
+    conversation_context: str | None = None,
+) -> RouterDecision:
+    """из запроса формирует решение по температуре, rag, и переписанному запросу."""
+    user_message = query
+    if conversation_context:
+        user_message = (
+            "Use the prior conversation only to resolve references in the current message. "
+            "Make the routing decision for the current message, not old requests.\n\n"
+            f"Prior conversation:\n{conversation_context}\n\n"
+            f"Current user message:\n{query}"
+        )
     messages = [
         {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
-        {"role": "user", "content": query},
+        {"role": "user", "content": user_message},
     ]
-    response = router_model(messages)
-    result_text = _coerce_model_text(response)
-    decision = parse_router_decision(result_text, router_model=router_model)
-
-    # Перепись должна быть сокращением, а не новым текстом: слишком длинный
-    # rewritten_query говорит о дрейфе смысла или инъекции через запрос.
+    decision = parse_router_decision(
+        _coerce_model_text(router_model(messages)),
+        router_model=router_model,
+    )
     if len(decision.rewritten_query) > 2 * len(query) + 50:
         raise ValueError("rewritten_query is much longer than the original query")
     return decision
 
-router_model = InferenceClientModel(
-    max_tokens=2096,
-    temperature=0.5,
-    model_id='Qwen/Qwen2.5-Coder-32B-Instruct',
-    custom_role_conversions=None,
-)
+#endregion
